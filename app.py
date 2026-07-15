@@ -34,7 +34,7 @@ st.markdown(
 
 
 FEEDS = {
-    "국토교통부": "https://www.molit.go.kr/dev/board/board_rss.jsp?rss_id=NEWS",
+    "국토부·정책": "https://news.google.com/rss/search?q=%EA%B5%AD%ED%86%A0%EA%B5%90%ED%86%B5%EB%B6%80%20%EA%B1%B4%EC%84%A4&hl=ko&gl=KR&ceid=KR:ko",
     "건축문화신문": "https://www.ancnews.kr/rss/allArticle.xml",
     "대한전문건설신문": "https://www.koscaj.com/rss/allArticle.xml",
 }
@@ -95,34 +95,32 @@ def load_news() -> tuple[pd.DataFrame, list[str]]:
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def load_worldbank_prices() -> tuple[pd.DataFrame, str]:
-    """Read the World Bank Pink Sheet. Returns an empty frame when its format changes."""
-    url = (
-        "https://thedocs.worldbank.org/en/doc/"
-        "5d903e848db1d1b83e0ec8f744e55570-0350012021/related/"
-        "CMO-Historical-Data-Monthly.xlsx"
-    )
-    try:
-        raw = pd.read_excel(url, sheet_name="Monthly Prices", skiprows=4)
-        date_col = raw.columns[0]
-        raw = raw.rename(columns={date_col: "date"})
-        raw["date"] = pd.to_datetime(raw["date"], errors="coerce")
-        raw = raw.dropna(subset=["date"]).sort_values("date")
-        wanted = {
-            "Copper": "구리",
-            "Aluminum": "알루미늄",
-            "Nickel": "니켈",
-            "Iron ore, cfr spot": "철광석",
-            "Crude oil, Brent": "브렌트유",
-            "Logs, S.E. Asia": "동남아 원목",
-        }
-        cols = [c for c in wanted if c in raw.columns]
-        if not cols:
-            return pd.DataFrame(), "세계은행 파일 형식 확인 필요"
-        out = raw[["date", *cols]].rename(columns=wanted).tail(36)
-        return out, "World Bank Pink Sheet"
-    except Exception:
-        return pd.DataFrame(), "세계은행 자료 연결 대기"
+def load_commodity_prices() -> tuple[pd.DataFrame, str]:
+    """Load individual IMF commodity series through FRED's stable CSV endpoint."""
+    series = {
+        "PCOPPUSDM": "구리",
+        "PALUMUSDM": "알루미늄",
+        "PNICKUSDM": "니켈",
+        "PIORECRUSDM": "철광석",
+        "PLOGOREUSDM": "원목",
+    }
+    frames = []
+    for code, korean_name in series.items():
+        try:
+            url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}"
+            frame = pd.read_csv(url)
+            frame.columns = ["date", korean_name]
+            frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+            frame[korean_name] = pd.to_numeric(frame[korean_name], errors="coerce")
+            frames.append(frame.dropna(subset=["date"]))
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame(), "FRED 원자재 자료 연결 대기"
+    out = frames[0]
+    for frame in frames[1:]:
+        out = out.merge(frame, on="date", how="outer")
+    return out.sort_values("date").tail(36), "FRED · IMF Primary Commodity Prices"
 
 
 def news_card(row: pd.Series) -> str:
@@ -150,7 +148,7 @@ with right:
     st.markdown(f"<div style='text-align:right;color:#7a8290;padding-top:18px'>{today}<br>접속 시 자동 갱신</div>", unsafe_allow_html=True)
 
 news, failed_feeds = load_news()
-prices, price_source = load_worldbank_prices()
+prices, price_source = load_commodity_prices()
 
 news_count = len(news)
 policy_count = int(news["tags"].apply(lambda x: "정책·법규" in x).sum()) if news_count else 0
@@ -226,4 +224,4 @@ with tab3:
     st.warning("이 화면에는 회사 내부 견적, 협력사 정보, 점포명 등 비공개 데이터를 입력하지 마세요.")
 
 st.divider()
-st.caption("자료 출처: 국토교통부 및 각 전문매체 RSS, World Bank Commodity Markets. 원문 저작권은 각 제공처에 있습니다.")
+st.caption("자료 출처: Google News의 국토부·정책 검색 RSS, 각 전문매체 RSS, FRED·IMF 원자재 가격. 원문 저작권은 각 제공처에 있습니다.")
