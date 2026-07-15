@@ -1,66 +1,70 @@
-from datetime import datetime
-from zoneinfo import ZoneInfo
-import html
-import io
-import json
-import re
-import urllib.parse
-import urllib.error
-import urllib.request
-import xml.etree.ElementTree as ET
-
-import pandas as pd
-import streamlit as st
 
 
-st.set_page_config(
-    page_title="인테리어·건설 Daily Briefing",
-    page_icon="🏗️",
-    layout="wide",
-)
-
-st.markdown(
-    """
-    <style>
-    .block-container {padding-top: 1.8rem; padding-bottom: 3rem; max-width: 1450px;}
-    [data-testid="stMetric"] {background:#fff; border:1px solid #e7eaf0; padding:16px; border-radius:14px;}
-    .brief {background:#effcf7; border:1px solid #77ddb1; border-radius:14px; padding:18px 20px; color:#174f3b;}
-    .news-card {background:#fff; border:1px solid #e6e9ef; border-left:5px solid #1c8c68;
-                border-radius:12px; padding:15px 17px; margin-bottom:12px; min-height:138px;}
-    .news-meta {color:#7a8290; font-size:0.82rem; margin-bottom:7px;}
-    .news-title {font-size:1.03rem; font-weight:700; line-height:1.45; margin-bottom:7px;}
-    .tag {display:inline-block; background:#edf7f3; color:#176b51; border-radius:999px;
-          padding:3px 9px; font-size:0.75rem; margin-right:5px;}
-    .muted {color:#7a8290; font-size:0.86rem;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+def fetch_text(url: str, timeout: int = 15) -> str:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; InteriorDaily/1.0)",
+            "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.7",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read()
+    for encoding in ("utf-8", "euc-kr", "cp949"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
-FEEDS = {
-    "국토부·정책": "https://news.google.com/rss/search?q=%EA%B5%AD%ED%86%A0%EA%B5%90%ED%86%B5%EB%B6%80%20%EA%B1%B4%EC%84%A4&hl=ko&gl=KR&ceid=KR:ko",
-    "건축문화신문": "https://www.ancnews.kr/rss/allArticle.xml",
-    "대한전문건설신문": "https://www.koscaj.com/rss/allArticle.xml",
-}
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_market_snapshot() -> tuple[pd.DataFrame, list[str]]:
+    rows, failed = [], []
+    try:
+        exchange_html = fetch_text("https://www.smbs.biz/ExRate/TodayExRate.jsp")
+        exchange_text = clean_text(exchange_html)
+        patterns = {
+            "달러/원": r"(?:미국\s*달러|USD).*?([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?)",
+            "유로/원": r"(?:유로|EUR).*?([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?)",
+        }
+        for name, pattern in patterns.items():
+            match = re.search(pattern, exchange_text, re.I)
+            if match:
+                rows.append(
+                    {
+                        "지표": name,
+                        "현재값": float(match.group(1).replace(",", "")),
+                        "단위": "원",
+                        "출처": "서울외국환중개",
+                        "공식 조회": "https://www.smbs.biz/ExRate/TodayExRate.jsp",
+                    }
+                )
+            else:
+                failed.append(name)
+    except Exception:
+        failed.extend(["달러/원", "유로/원"])
 
-KEYWORDS = {
-    "정책·법규": ["법", "제도", "정책", "기준", "규제", "국토부", "공고"],
-    "공사비·원가": ["공사비", "원가", "가격", "단가", "물가", "노임", "환율"],
-    "건축자재": ["자재", "철강", "구리", "유리", "타일", "목재", "시멘트", "가구"],
-    "실내건축": ["실내건축", "인테리어", "리모델링", "마감", "공간"],
-    "안전·하도급": ["안전", "하도급", "산재", "중대재해", "사고"],
-}
-
-
-def clean_text(value: str) -> str:
-    value = re.sub(r"<[^>]+>", " ", value or "")
-    return re.sub(r"\s+", " ", html.unescape(value)).strip()
-
-
-def classify(text: str) -> list[str]:
-    found = [name for name, words in KEYWORDS.items() if any(w in text for w in words)]
-    return found[:2] or ["건설·건축"]
+    try:
+        eia_html = fetch_text("https://www.eia.gov/todayinenergy/prices.php")
+        eia_text = clean_text(eia_html)
+        for name in ("WTI", "Brent"):
+            match = re.search(rf"\b{name}\b\s+([0-9]+(?:\.[0-9]+)?)", eia_text, re.I)
+            if match:
+                rows.append(
+                    {
+                        "지표": name + " 유가",
+                        "현재값": float(match.group(1)),
+                        "단위": "USD/배럴",
+                        "출처": "미국 에너지정보청(EIA)",
+                        "공식 조회": "https://www.eia.gov/todayinenergy/prices.php",
+                    }
+                )
+            else:
+                failed.append(name + " 유가")
+    except Exception:
+        failed.extend(["WTI 유가", "Brent 유가"])
+    return pd.DataFrame(rows), failed
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -454,6 +458,7 @@ with right:
     st.markdown(f"<div style='text-align:right;color:#7a8290;padding-top:18px'>{today}<br>접속 시 자동 갱신</div>", unsafe_allow_html=True)
 
 news, failed_feeds = load_news()
+market_snapshot, failed_market = load_market_snapshot()
 prices, price_source, failed_prices, price_details = load_commodity_prices()
 
 news_count = len(news)
@@ -475,8 +480,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["📰 주요 뉴스", "📈 원자재 동향", "🧱 이번주 원자재 영향", "💰 조달 자재가격", "🏪 프랜차이즈 가맹점 투자비 현황"]
+tab1, tab_market, tab2, tab3, tab4, tab5 = st.tabs(
+    ["📰 주요 뉴스", "🌍 시장동향", "📈 원자재 동향", "🧱 이번주 원자재 영향", "💰 조달 자재가격", "🏪 프랜차이즈 가맹점 투자비 현황"]
 )
 
 with tab1:
@@ -495,6 +500,43 @@ with tab1:
                 st.markdown(news_card(row), unsafe_allow_html=True)
     if failed_feeds:
         st.caption("일시적으로 연결되지 않은 출처: " + ", ".join(failed_feeds))
+
+with tab_market:
+    st.subheader("환율·에너지·주요 자재 시장동향")
+    st.caption("공식 공개페이지에서 자동 확인 가능한 값과, 별도 구독·조회 대상 자료를 구분했습니다.")
+    if market_snapshot.empty:
+        st.warning("환율·유가 공개페이지가 현재 응답하지 않습니다. 아래 공식 조회 링크를 이용해 주세요.")
+    else:
+        st.dataframe(
+            market_snapshot,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "현재값": st.column_config.NumberColumn(format="%,.2f"),
+                "공식 조회": st.column_config.LinkColumn(display_text="열기"),
+            },
+        )
+    if failed_market:
+        st.caption("자동 갱신 대기: " + " · ".join(dict.fromkeys(failed_market)))
+
+    st.markdown("#### 추가 자재가격 공식 조회")
+    source_guide = pd.DataFrame(
+        [
+            ["철광석", "USD/톤", "한국자원정보서비스(KOMIS)", "공식 사이트 조회", "https://www.komis.or.kr/"],
+            ["니켈·알루미늄", "USD/톤", "런던금속거래소(LME)", "라이선스 데이터", "https://www.lme.com/market-data/accessing-market-data"],
+            ["STS", "USD/톤", "LME 원재료 지표 참고", "LME 직접 계약 품목 아님", "https://www.lme.com/market-data/accessing-market-data"],
+            ["유리", "원/장", "한국물가정보", "회원·가격자료 조회", "https://www.kpi.or.kr/www/"],
+            ["MDF·합판·석고보드", "원/장", "한국목재신문", "기사·시황 조회", "https://www.woodkorea.co.kr/"],
+        ],
+        columns=["품목", "요청 단위", "출처", "자동 연동 상태", "공식 조회"],
+    )
+    st.dataframe(
+        source_guide,
+        use_container_width=True,
+        hide_index=True,
+        column_config={"공식 조회": st.column_config.LinkColumn(display_text="열기")},
+    )
+    st.info("LME·한국물가정보의 가격을 웹에 자동 재게시하려면 해당 기관의 데이터 이용권한 또는 API 계약이 필요합니다.")
 
 with tab2:
     st.subheader("글로벌 원자재 가격 추세")
