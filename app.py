@@ -353,16 +353,17 @@ def load_franchise_interior_costs(
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def load_franchise_brand_list(service_key: str, base_year: str) -> pd.DataFrame:
-    """Load franchise outlets and reduce them to unique brand-name suggestions."""
+    """Load the FTC brand master list for brand-name suggestions."""
     params = {
         "serviceKey": service_key,
         "pageNo": 1,
         "numOfRows": 1000,
         "year": base_year.strip(),
+        "type": "json",
     }
     url = (
-        "https://apis.data.go.kr/1130000/FftcbrandfrcslistinfoService/"
-        "getbrandFrcsListinfo?" + urllib.parse.urlencode(params)
+        "https://apis.data.go.kr/1130000/FftcBrandRlsInfo2_Service/"
+        "getBrandinfo?" + urllib.parse.urlencode(params)
     )
     request = urllib.request.Request(
         url, headers={"User-Agent": "Mozilla/5.0 (compatible; InteriorDaily/1.0)"}
@@ -792,7 +793,10 @@ with tab5:
                 st.caption("브랜드명을 입력하면 아래에 최대 30개의 추천 브랜드가 표시됩니다.")
         except Exception as exc:
             st.warning(f"브랜드 추천 목록을 불러오지 못했습니다: {exc}")
-            st.caption("승인 직후라면 잠시 뒤 다시 시도할 수 있습니다.")
+            st.caption(
+                "공공데이터포털에서 ‘브랜드 목록 정보 제공 서비스’ 활용신청 상태와 "
+                "인증키를 확인해 주세요. 추천 없이 브랜드관리번호를 직접 입력해도 조회할 수 있습니다."
+            )
 
         manual_brand_no = st.text_input(
             "브랜드관리번호 직접 입력(선택)",
