@@ -5,6 +5,7 @@ import io
 import json
 import re
 import urllib.parse
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -99,7 +100,7 @@ def load_news() -> tuple[pd.DataFrame, list[str]]:
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def load_commodity_prices() -> tuple[pd.DataFrame, str, list[str]]:
+def load_commodity_prices() -> tuple[pd.DataFrame, str, list[str], dict]:
     """Load daily market prices first, with monthly FRED data as a fallback."""
     market_series = {
         "HG=F": "구리",
@@ -108,7 +109,14 @@ def load_commodity_prices() -> tuple[pd.DataFrame, str, list[str]]:
         "TIO=F": "철광석",
         "LBS=F": "원목",
     }
-    frames, failed = [], []
+    units = {
+        "구리": "USD/파운드",
+        "알루미늄": "USD/톤",
+        "니켈": "USD/톤",
+        "철광석": "USD/톤",
+        "원목": "USD/1,000 board feet",
+    }
+    frames, failed, details, loaded_names = [], [], {}, set()
     for symbol, korean_name in market_series.items():
         try:
             encoded_symbol = urllib.parse.quote(symbol, safe="")
@@ -139,46 +147,55 @@ def load_commodity_prices() -> tuple[pd.DataFrame, str, list[str]]:
             if frame.empty:
                 raise ValueError("공표값 없음")
             frames.append(frame)
+            loaded_names.add(korean_name)
+            details[korean_name] = {
+                "unit": units[korean_name],
+                "source": "Yahoo Finance 선물 일별 종가",
+            }
         except Exception as exc:
-            failed.append(f"{korean_name}: {type(exc).__name__}")
+            failed.append(f"{korean_name} 일별: {type(exc).__name__}")
 
-    # Yahoo가 전부 막힌 경우에도 월별 공표값을 보여주는 안전망입니다.
+    # 일별 심볼이 없는 품목만 FRED·IMF 월별 공표값으로 각각 보완합니다.
+    fred_series = {
+        "PCOPPUSDM": ("구리", "USD/톤"),
+        "PALUMUSDM": ("알루미늄", "USD/톤"),
+        "PNICKUSDM": ("니켈", "USD/톤"),
+        "PIORECRUSDM": ("철광석", "USD/톤"),
+        "PLOGOREUSDM": ("원목", "USD/㎥"),
+    }
+    for code, (korean_name, fred_unit) in fred_series.items():
+        if korean_name in loaded_names:
+            continue
+        try:
+            url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}"
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "text/csv,*/*"},
+            )
+            with urllib.request.urlopen(request, timeout=20) as response:
+                frame = pd.read_csv(io.BytesIO(response.read()))
+            frame.columns = ["date", korean_name]
+            frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+            frame[korean_name] = pd.to_numeric(frame[korean_name], errors="coerce")
+            frame = frame.dropna(subset=["date", korean_name])
+            if frame.empty:
+                raise ValueError("공표값 없음")
+            frames.append(frame)
+            loaded_names.add(korean_name)
+            details[korean_name] = {
+                "unit": fred_unit,
+                "source": "FRED · IMF 월별 공표가격",
+            }
+        except Exception as exc:
+            failed.append(f"{korean_name} 월별: {type(exc).__name__}")
     if not frames:
-        fred_series = {
-            "PCOPPUSDM": "구리",
-            "PALUMUSDM": "알루미늄",
-            "PNICKUSDM": "니켈",
-            "PIORECRUSDM": "철광석",
-            "PLOGOREUSDM": "원목",
-        }
-        failed = []
-        for code, korean_name in fred_series.items():
-            try:
-                url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}"
-                request = urllib.request.Request(
-                    url,
-                    headers={"User-Agent": "Mozilla/5.0", "Accept": "text/csv,*/*"},
-                )
-                with urllib.request.urlopen(request, timeout=20) as response:
-                    frame = pd.read_csv(io.BytesIO(response.read()))
-                frame.columns = ["date", korean_name]
-                frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
-                frame[korean_name] = pd.to_numeric(frame[korean_name], errors="coerce")
-                frame = frame.dropna(subset=["date", korean_name])
-                if frame.empty:
-                    raise ValueError("공표값 없음")
-                frames.append(frame)
-            except Exception as exc:
-                failed.append(f"{korean_name}: {type(exc).__name__}")
-        if not frames:
-            return pd.DataFrame(), "원자재 자료 연결 대기", failed
-        source = "FRED · IMF 월별 공표가격(대체 자료)"
-    else:
-        source = "Yahoo Finance 원자재 선물 일별 종가"
+        return pd.DataFrame(), "원자재 자료 연결 대기", failed, details
+    sources = sorted({item["source"] for item in details.values()})
+    source = " + ".join(sources)
     out = frames[0]
     for frame in frames[1:]:
         out = out.merge(frame, on="date", how="outer")
-    return out.sort_values("date").tail(90), source, failed
+    return out.sort_values("date").tail(90), source, failed, details
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -189,14 +206,9 @@ def load_franchise_interior_costs(
         "serviceKey": service_key,
         "pageNo": 1,
         "numOfRows": 100,
-        "resultType": "json",
-        "type": "json",
-        "_type": "json",
+        "year": base_year.strip(),
+        "brandManageNo": brand_manage_no.strip(),
     }
-    if base_year.strip():
-        params["yr"] = base_year.strip()
-    if brand_manage_no.strip():
-        params["brandManageNo"] = brand_manage_no.strip()
 
     url = (
         "https://apis.data.go.kr/1130000/FftcBrandFrcsIntInfo2_Service/"
@@ -205,8 +217,12 @@ def load_franchise_interior_costs(
     request = urllib.request.Request(
         url, headers={"User-Agent": "Mozilla/5.0 (compatible; InteriorDaily/1.0)"}
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        raw = response.read()
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise ValueError(f"HTTP {exc.code}: {clean_text(detail)}") from exc
     try:
         payload = json.loads(raw.decode("utf-8"))
     except Exception:
@@ -251,9 +267,9 @@ def load_franchise_interior_costs(
     for item in items:
         rows.append(
             {
-                "기준년도": pick(item, "yr", "baseYr", "bsnsYr"),
+                "기준년도": pick(item, "year", "yr", "baseYr", "bsnsYr"),
                 "브랜드명": pick(item, "brandNm", "brndNm"),
-                "브랜드관리번호": pick(item, "brandManageNo", "brndMngNo"),
+                "브랜드관리번호": pick(item, "brandManageNo", "brandMnno", "brndMngNo"),
                 "단위면적 인테리어금액": pd.to_numeric(
                     pick(item, "unitArIntrrAmt", "unitAreaIntrrAmt"), errors="coerce"
                 ),
@@ -269,15 +285,13 @@ def load_franchise_interior_costs(
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def load_franchise_brand_list(service_key: str) -> pd.DataFrame:
+def load_franchise_brand_list(service_key: str, base_year: str) -> pd.DataFrame:
     """Load franchise outlets and reduce them to unique brand-name suggestions."""
     params = {
         "serviceKey": service_key,
         "pageNo": 1,
         "numOfRows": 1000,
-        "resultType": "json",
-        "type": "json",
-        "_type": "json",
+        "year": base_year.strip(),
     }
     url = (
         "https://apis.data.go.kr/1130000/FftcbrandfrcslistinfoService/"
@@ -286,8 +300,12 @@ def load_franchise_brand_list(service_key: str) -> pd.DataFrame:
     request = urllib.request.Request(
         url, headers={"User-Agent": "Mozilla/5.0 (compatible; InteriorDaily/1.0)"}
     )
-    with urllib.request.urlopen(request, timeout=25) as response:
-        raw = response.read()
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise ValueError(f"HTTP {exc.code}: {clean_text(detail)}") from exc
     try:
         payload = json.loads(raw.decode("utf-8"))
         api_response = payload.get("response", payload)
@@ -325,7 +343,7 @@ def load_franchise_brand_list(service_key: str) -> pd.DataFrame:
             {
                 "브랜드명": pick(item, "brandNm", "brndNm"),
                 "브랜드관리번호": pick(
-                    item, "brandManageNo", "brndMngNo", "jnghdqrtrsBrandManageNo"
+                    item, "brandManageNo", "brandMnno", "brndMngNo", "jnghdqrtrsBrandManageNo"
                 ),
             }
         )
@@ -358,7 +376,7 @@ def load_g2b_prices(
     params = {
         "serviceKey": service_key,
         "pageNo": 1,
-        "numOfRows": 100,
+        "numOfRows": 999,
         "type": "json",
     }
     if item_keyword.strip():
@@ -436,7 +454,7 @@ with right:
     st.markdown(f"<div style='text-align:right;color:#7a8290;padding-top:18px'>{today}<br>접속 시 자동 갱신</div>", unsafe_allow_html=True)
 
 news, failed_feeds = load_news()
-prices, price_source, failed_prices = load_commodity_prices()
+prices, price_source, failed_prices, price_details = load_commodity_prices()
 
 news_count = len(news)
 policy_count = int(news["tags"].apply(lambda x: "정책·법규" in x).sum()) if news_count else 0
@@ -458,7 +476,7 @@ st.markdown(
 )
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["📰 주요 뉴스", "📈 원자재 동향", "🧱 이번주 원자재 영향", "💰 조달 자재가격", "🏪 프랜차이즈 가맹점 인테리어 투자비 현황"]
+    ["📰 주요 뉴스", "📈 원자재 동향", "🧱 이번주 원자재 영향", "💰 조달 자재가격", "🏪 프랜차이즈 가맹점 투자비 현황"]
 )
 
 with tab1:
@@ -492,22 +510,29 @@ with tab2:
         options = [c for c in prices.columns if c != "date"]
         selected = st.multiselect("표시 품목", options, default=options[:3])
         if selected:
+            unit_text = " · ".join(
+                f"{name}: {price_details.get(name, {}).get('unit', '단위 확인 중')}"
+                for name in selected
+            )
+            st.info("금액 단위 — " + unit_text)
             chart_data = prices.set_index("date")[selected]
             st.line_chart(chart_data, height=440)
-            latest = prices.dropna(subset=selected, how="all").tail(2)
-            if len(latest) == 2:
-                cards = st.columns(len(selected))
-                for card, name in zip(cards, selected):
-                    prev, curr = latest[name].iloc[-2], latest[name].iloc[-1]
+            cards = st.columns(len(selected))
+            for card, name in zip(cards, selected):
+                item_values = prices[name].dropna()
+                if len(item_values) >= 2:
+                    prev, curr = item_values.iloc[-2], item_values.iloc[-1]
                     change = ((curr / prev) - 1) * 100 if pd.notna(prev) and prev else 0
-                    period_label = "전일비" if "일별" in price_source else "전월비"
-                    card.metric(name, f"{curr:,.1f}", f"{change:+.1f}% {period_label}")
+                    item_source = price_details.get(name, {}).get("source", "")
+                    period_label = "전일비" if "일별" in item_source else "전월비"
+                    item_unit = price_details.get(name, {}).get("unit", "")
+                    card.metric(f"{name} ({item_unit})", f"{curr:,.1f}", f"{change:+.1f}% {period_label}")
         if failed_prices:
             st.caption("일부 품목 연결 대기: " + " · ".join(failed_prices))
 
 with tab3:
     st.subheader("이번주 원자재 영향")
-    st.caption("최근 거래일 종가와 약 1주 전(5거래일 전) 종가를 비교합니다.")
+    st.caption("일별 자료는 약 1주 전과, 월별 대체자료는 직전 공표월과 비교합니다.")
     impact_map = [
         ("금속공사", "니켈", "스테인리스·금속가공 단가와 납기 확인"),
         ("전기공사", "구리", "전선·케이블 자재비 변동 확인"),
@@ -517,19 +542,23 @@ with tab3:
     ]
     impact_rows = []
     for process, material, point in impact_map:
-        change_text, signal = "연결 대기", "자료 확인 필요"
+        change_text, signal, comparison = "연결 대기", "자료 확인 필요", "-"
+        item_source = price_details.get(material, {}).get("source", "연결 대기")
+        item_unit = price_details.get(material, {}).get("unit", "-")
         if material in prices.columns:
             values = prices[["date", material]].dropna().sort_values("date")
             if len(values) >= 2:
-                lookback = min(6, len(values))
+                is_daily = "일별" in item_source
+                lookback = min(6 if is_daily else 2, len(values))
                 old, new = values[material].iloc[-lookback], values[material].iloc[-1]
                 change = ((new / old) - 1) * 100 if old else 0
                 change_text = f"{change:+.1f}%"
+                comparison = "최근 1주" if is_daily else "전월 대비"
                 signal = "상승 압력" if change > 1 else "하락 가능" if change < -1 else "보합권"
-        impact_rows.append([process, material, change_text, signal, point])
+        impact_rows.append([process, material, item_unit, comparison, change_text, signal, point, item_source])
     impact = pd.DataFrame(
         impact_rows,
-        columns=["관련 공정", "원자재", "최근 1주 변동", "비용 신호", "구매 검토 포인트"],
+        columns=["관련 공정", "원자재", "단위", "비교 기준", "가격 변동", "비용 신호", "구매 검토 포인트", "자료 출처"],
     )
     st.dataframe(impact, use_container_width=True, hide_index=True)
     st.caption("원자재 변동이 실제 자재 견적에 반영되는 시점과 폭은 환율·재고·가공비·운송비에 따라 달라집니다.")
@@ -556,6 +585,9 @@ with tab4:
                         catalog["품명"].dropna().astype(str).unique().tolist()
                     )
                     st.session_state["g2b_names_category"] = g2b_category
+                    st.success(
+                        f"{g2b_category} 분야 품명 {len(st.session_state['g2b_names']):,}개를 불러왔습니다."
+                    )
                 except Exception as exc:
                     st.error(f"품명 목록을 불러오지 못했습니다: {exc}")
             available_names = (
@@ -590,7 +622,7 @@ with tab4:
                     if g2b_prices.empty:
                         st.info("검색 결과가 없습니다. 품명을 짧게 입력해 보세요. 예: 타일, 유리, 전선")
                     else:
-                        st.metric("검색 결과", f"전체 {total_count:,}건 · 최대 100건 표시")
+                        st.metric("검색 결과", f"전체 {total_count:,}건 · 최대 999건 표시")
                         st.dataframe(
                             g2b_prices,
                             use_container_width=True,
@@ -614,20 +646,27 @@ with tab4:
                     )
 
 with tab5:
-    st.subheader("프랜차이즈 가맹점 인테리어 투자비 현황")
+    st.subheader("프랜차이즈 가맹점 투자비 현황")
     st.caption("정보공개서 기반 공개자료입니다. 실제 공사 견적이나 현재 계약금액과 다를 수 있습니다.")
     service_key = get_data_go_key()
     if not service_key:
         st.error("Streamlit Secrets에 DATA_GO_KR_KEY를 저장해 주세요.")
     else:
-        franchise_year = st.text_input("기준년도(선택)", placeholder="예: 2023")
+        current_year = datetime.now(ZoneInfo("Asia/Seoul")).year
+        year_options = [str(year) for year in range(current_year - 1, 2017, -1)]
+        franchise_year = st.selectbox(
+            "정보공개서 기준년도(필수)",
+            year_options,
+            index=min(1, len(year_options) - 1),
+            help="공표 시차 때문에 최근 연도에 자료가 없으면 한 해 이전을 선택해 보세요.",
+        )
         brand_query = st.text_input(
             "프랜차이즈 브랜드 검색", placeholder="예: 메가커피, 교촌, 올리브영"
         )
         selected_brand_no = ""
         try:
             with st.spinner("브랜드 목록을 준비하고 있습니다..."):
-                brand_catalog = load_franchise_brand_list(service_key)
+                brand_catalog = load_franchise_brand_list(service_key, franchise_year)
             if brand_query.strip():
                 matched = brand_catalog[
                     brand_catalog["브랜드명"].str.contains(
@@ -656,7 +695,7 @@ with tab5:
         )
         franchise_brand_no = selected_brand_no or manual_brand_no.strip()
         if st.button("인테리어 투자비 조회", type="primary", use_container_width=True):
-            if not franchise_year.strip() and not franchise_brand_no.strip():
+            if not franchise_brand_no.strip():
                 st.warning("브랜드를 검색해서 선택하거나 브랜드관리번호를 입력해 주세요.")
             else:
                 try:
