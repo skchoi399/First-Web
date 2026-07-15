@@ -39,7 +39,9 @@ st.markdown(
 
 
 FEEDS = {
-    "국토부·정책": "https://news.google.com/rss/search?q=%EA%B5%AD%ED%86%A0%EA%B5%90%ED%86%B5%EB%B6%80%20%EA%B1%B4%EC%84%A4&hl=ko&gl=KR&ceid=KR:ko",
+    "국토부 보도자료": "https://www.molit.go.kr/dev/board/board_rss.jsp?rss_id=N0303_B",
+    "국토부 정책자료": "https://www.molit.go.kr/dev/board/board_rss.jsp?rss_id=N04_B",
+    "Google News·국토부 건설": "https://news.google.com/rss/search?q=%EA%B5%AD%ED%86%A0%EA%B5%90%ED%86%B5%EB%B6%80%20%EA%B1%B4%EC%84%A4&hl=ko&gl=KR&ceid=KR:ko",
     "건축문화신문": "https://www.ancnews.kr/rss/allArticle.xml",
     "대한전문건설신문": "https://www.koscaj.com/rss/allArticle.xml",
 }
@@ -436,6 +438,79 @@ def get_data_go_key() -> str:
         return ""
 
 
+def get_kosis_key() -> str:
+    try:
+        return str(st.secrets.get("KOSIS_API_KEY", "")).strip()
+    except Exception:
+        return ""
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_kosis_wages(api_key: str) -> pd.DataFrame:
+    """Load the latest two half-year construction wage observations from KOSIS."""
+    params = {
+        "method": "getList",
+        "apiKey": api_key,
+        "orgId": "365",
+        "tblId": "TX_36504_A001_1",
+        "itmId": "ALL",
+        "objL1": "ALL",
+        "objL2": "",
+        "objL3": "",
+        "objL4": "",
+        "objL5": "",
+        "objL6": "",
+        "objL7": "",
+        "objL8": "",
+        "prdSe": "H",
+        "newEstPrdCnt": 2,
+        "prdInterval": 1,
+        "format": "json",
+        "jsonVD": "Y",
+    }
+    url = (
+        "https://kosis.kr/openapi/Param/statisticsParameterData.do?"
+        + urllib.parse.urlencode(params)
+    )
+    raw = fetch_text(url, timeout=25)
+    payload = json.loads(raw)
+    if isinstance(payload, dict) and payload.get("err"):
+        raise ValueError(payload.get("errMsg", "KOSIS API 요청 실패"))
+    if not isinstance(payload, list):
+        raise ValueError("KOSIS 응답 형식을 확인할 수 없습니다.")
+
+    trade_words = (
+        "도장", "타일", "내장", "목공", "미장", "방수", "유리", "배관",
+        "전기", "용접", "석공", "창호", "도배", "덕트", "일반공사직종",
+    )
+    rows = []
+    for item in payload:
+        labels = [str(item.get(f"C{i}_NM", "")).strip() for i in range(1, 9)]
+        labels.append(str(item.get("ITM_NM", "")).strip())
+        trade = next((label for label in labels if any(word in label for word in trade_words)), "")
+        value = pd.to_numeric(item.get("DT"), errors="coerce")
+        if trade and pd.notna(value):
+            rows.append({"직종": trade, "적용시점": str(item.get("PRD_DE", "")), "노임단가": value})
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    frame = frame.drop_duplicates(subset=["직종", "적용시점"], keep="last")
+    periods = sorted(frame["적용시점"].unique(), reverse=True)[:2]
+    latest = frame[frame["적용시점"] == periods[0]][["직종", "노임단가"]].rename(
+        columns={"노임단가": "현재 노임단가"}
+    )
+    latest["적용시점"] = periods[0]
+    if len(periods) > 1:
+        previous = frame[frame["적용시점"] == periods[1]][["직종", "노임단가"]].rename(
+            columns={"노임단가": "직전 노임단가"}
+        )
+        latest = latest.merge(previous, on="직종", how="left")
+        latest["직전 대비"] = (
+            (latest["현재 노임단가"] / latest["직전 노임단가"] - 1) * 100
+        )
+    return latest.sort_values("직종").reset_index(drop=True)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_g2b_prices(
     service_key: str, category: str, item_keyword: str, spec_keyword: str
@@ -544,8 +619,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab1, tab_market, tab2, tab3, tab4, tab5 = st.tabs(
-    ["📰 주요 뉴스", "🌍 시장동향", "📈 원자재 동향", "🧱 이번주 원자재 영향", "💰 조달 자재가격", "🏪 프랜차이즈 가맹점 투자비 현황"]
+tab1, tab_market, tab_wage, tab2, tab3, tab4, tab5 = st.tabs(
+    ["📰 주요 뉴스", "🌍 시장동향", "👷 직종별 노임", "📈 원자재 동향", "🧱 이번주 원자재 영향", "💰 조달 자재가격", "🏪 프랜차이즈 가맹점 투자비 현황"]
 )
 
 with tab1:
@@ -601,6 +676,34 @@ with tab_market:
         column_config={"공식 조회": st.column_config.LinkColumn(display_text="열기")},
     )
     st.info("LME·한국물가정보의 가격을 웹에 자동 재게시하려면 해당 기관의 데이터 이용권한 또는 API 계약이 필요합니다.")
+
+with tab_wage:
+    st.subheader("건설·인테리어 직종별 노임단가")
+    st.caption("KOSIS 건설업임금실태조사의 최신 2개 반기 자료입니다. 단위는 원/일입니다.")
+    kosis_key = get_kosis_key()
+    if not kosis_key:
+        st.error("Streamlit Secrets에 KOSIS_API_KEY를 저장해 주세요.")
+    else:
+        try:
+            with st.spinner("KOSIS 직종별 노임단가를 불러오고 있습니다..."):
+                wage_data = load_kosis_wages(kosis_key)
+            if wage_data.empty:
+                st.info("선택한 인테리어 관련 직종의 노임자료가 없습니다.")
+            else:
+                st.dataframe(
+                    wage_data,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "현재 노임단가": st.column_config.NumberColumn(format="%,.0f원/일"),
+                        "직전 노임단가": st.column_config.NumberColumn(format="%,.0f원/일"),
+                        "직전 대비": st.column_config.NumberColumn(format="%+.1f%%"),
+                    },
+                )
+                st.caption("출처: KOSIS 국가통계포털 · 대한건설협회 건설업임금실태조사")
+        except Exception as exc:
+            st.error(f"KOSIS 노임자료를 불러오지 못했습니다: {exc}")
+            st.caption("인증키 저장 직후라면 잠시 뒤 다시 시도하거나 KOSIS 활용신청 상태를 확인해 주세요.")
 
 with tab2:
     st.subheader("글로벌 원자재 가격 추세")
@@ -831,4 +934,4 @@ with tab5:
                     st.caption("신규 승인 직후라면 인증키 반영까지 시간이 걸릴 수 있습니다.")
 
 st.divider()
-st.caption("자료 출처: Google News의 국토부·정책 검색 RSS, 각 전문매체 RSS, Yahoo Finance 원자재 선물·FRED·IMF 공표가격, 조달청 가격정보현황서비스, 공정거래위원회 가맹정보. 원문 저작권은 각 제공처에 있습니다.")
+st.caption("자료 출처: 국토교통부 공식 RSS, Google News의 국토부·건설 검색 RSS, 각 전문매체 RSS, KOSIS 건설업임금실태조사, Yahoo Finance 원자재 선물·FRED·IMF 공표가격, 조달청 가격정보현황서비스, 공정거래위원회 가맹정보. 원문 저작권은 각 제공처에 있습니다.")
