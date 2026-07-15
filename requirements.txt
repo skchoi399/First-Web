@@ -1,5 +1,3 @@
-streamlit
-pandas
-plotly
-requests
-feedparser
+streamlit>=1.39,<2
+pandas>=2.1,<3
+openpyxl>=3.1,<4
