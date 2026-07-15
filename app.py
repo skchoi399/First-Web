@@ -511,6 +511,94 @@ def load_kosis_wages(api_key: str) -> pd.DataFrame:
     return latest.sort_values("직종").reset_index(drop=True)
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_kiscon_companies(
+    service_key: str, start_date: str, end_date: str, area: str
+) -> tuple[pd.DataFrame, int]:
+    """Load KISCON construction-business registration disclosures."""
+    rows, page, total = [], 1, 0
+    while page <= 10:
+        params = {
+            "ServiceKey": service_key,
+            "pageNo": page,
+            "numOfRows": 500,
+            "sDate": start_date,
+            "eDate": end_date,
+            "_type": "json",
+        }
+        if area and area != "전체":
+            params["ncrAreaName"] = area
+        url = (
+            "https://apis.data.go.kr/1613000/ConAdminInfoSvc1/GongsiReg?"
+            + urllib.parse.urlencode(params)
+        )
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0 (compatible; InteriorDaily/1.0)"}
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            raise ValueError(f"HTTP {exc.code}: {clean_text(detail)}") from exc
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            api_response = payload.get("response", payload)
+            header = api_response.get("header", {})
+            code = str(header.get("resultCode", ""))
+            if code not in {"00", "0"}:
+                raise ValueError(header.get("resultMsg", "KISCON API 요청 실패"))
+            body = api_response.get("body", {})
+            items = body.get("items", [])
+            if isinstance(items, dict):
+                items = items.get("item", items)
+            if isinstance(items, dict):
+                items = [items]
+            total = int(body.get("totalCount", 0) or 0)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            root = ET.fromstring(raw)
+            code = root.findtext(".//resultCode", "")
+            if code not in {"00", "0"}:
+                raise ValueError(root.findtext(".//resultMsg", "KISCON API 요청 실패"))
+            items = [
+                {child.tag: child.text or "" for child in item}
+                for item in root.findall(".//item")
+            ]
+            total = int(root.findtext(".//totalCount", "0") or 0)
+        if not isinstance(items, list) or not items:
+            break
+        rows.extend(items)
+        if len(rows) >= total:
+            break
+        page += 1
+
+    def pick(item: dict, *names: str):
+        for name in names:
+            if item.get(name) not in {None, ""}:
+                return str(item.get(name)).strip()
+        return ""
+
+    result = []
+    for item in rows:
+        result.append(
+            {
+                "업체명": pick(item, "ncrGsKname"),
+                "대표자": pick(item, "ncrGsMaster"),
+                "면허·업종": pick(item, "ncrItemName"),
+                "지역": " ".join(
+                    filter(None, [pick(item, "ncrAreaName"), pick(item, "ncrAreaDetailName")])
+                ),
+                "소재지": pick(item, "ncrGsAddr"),
+                "등록일자": pick(item, "ncrGsDate"),
+                "공시구분": pick(item, "ncrGsFlag"),
+                "공시일자": pick(item, "ncrGsRegdate"),
+                "공고번호": pick(item, "ncrGsNumber"),
+            }
+        )
+    return pd.DataFrame(result), total
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_g2b_prices(
     service_key: str, category: str, item_keyword: str, spec_keyword: str
@@ -619,8 +707,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab1, tab_market, tab_wage, tab2, tab3, tab4, tab5 = st.tabs(
-    ["📰 주요 뉴스", "🌍 시장동향", "👷 직종별 노임", "📈 원자재 동향", "🧱 이번주 원자재 영향", "💰 조달 자재가격", "🏪 프랜차이즈 가맹점 투자비 현황"]
+tab1, tab_market, tab_wage, tab_license, tab2, tab3, tab4, tab5 = st.tabs(
+    ["📰 주요 뉴스", "🌍 시장동향", "👷 직종별 노임", "🔎 업체 면허 조회", "📈 원자재 동향", "🧱 이번주 원자재 영향", "💰 조달 자재가격", "🏪 프랜차이즈 가맹점 투자비 현황"]
 )
 
 with tab1:
@@ -704,6 +792,113 @@ with tab_wage:
         except Exception as exc:
             st.error(f"KOSIS 노임자료를 불러오지 못했습니다: {exc}")
             st.caption("인증키 저장 직후라면 잠시 뒤 다시 시도하거나 KOSIS 활용신청 상태를 확인해 주세요.")
+
+with tab_license:
+    st.subheader("건설·설비·전기공사업체 면허 조회")
+    st.caption(
+        "KISCON 등록·변경 공시자료에서 실내건축·기계설비 업체를 검색합니다. "
+        "전기공사업은 별도 법령·관리시스템이므로 한국전기공사협회에서 최종 확인합니다."
+    )
+    license_key = get_data_go_key()
+    if not license_key:
+        st.error("Streamlit Secrets에 DATA_GO_KR_KEY를 저장해 주세요.")
+    else:
+        l1, l2, l3 = st.columns([1.4, 1, 1])
+        with l1:
+            company_query = st.text_input(
+                "업체명", placeholder="예: ○○디자인 (주), 주식회사 제외 가능"
+            )
+        with l2:
+            license_type = st.selectbox(
+                "면허·업종",
+                ["실내건축공사업", "기계설비공사업", "전체 건설업종", "전기공사업(공식조회)"],
+            )
+        with l3:
+            area_options = [
+                "전체", "서울", "부산", "대구", "인천", "광주", "대전", "울산",
+                "세종시", "경기", "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주",
+            ]
+            license_area = st.selectbox("등록지역", area_options)
+
+        if license_type == "전기공사업(공식조회)":
+            st.info(
+                "전기공사업은 KISCON 조회 대상이 아닙니다. 아래 전기공사 종합정보시스템에서 "
+                "업체명·등록번호로 최신 등록상태를 확인해 주세요."
+            )
+            st.link_button(
+                "한국전기공사협회에서 전기공사업체 조회",
+                "https://www.keca.or.kr/ecic",
+                use_container_width=True,
+            )
+        else:
+            date_default_end = datetime.now(ZoneInfo("Asia/Seoul")).date()
+            date_default_start = (pd.Timestamp(date_default_end) - pd.DateOffset(years=5)).date()
+            date_range = st.date_input(
+                "KISCON 공시기간",
+                value=(date_default_start, date_default_end),
+                help="오래전에 등록된 업체가 나오지 않으면 기간을 늘리거나 공식 상세조회를 이용하세요.",
+            )
+            if st.button("면허업체 검색", type="primary", use_container_width=True):
+                if not company_query.strip():
+                    st.warning("검색할 업체명을 입력해 주세요.")
+                elif not isinstance(date_range, (tuple, list)) or len(date_range) != 2:
+                    st.warning("공시기간의 시작일과 종료일을 모두 선택해 주세요.")
+                else:
+                    try:
+                        with st.spinner("KISCON 등록 공시자료를 검색하고 있습니다..."):
+                            companies, kiscon_total = load_kiscon_companies(
+                                license_key,
+                                date_range[0].strftime("%Y%m%d"),
+                                date_range[1].strftime("%Y%m%d"),
+                                license_area,
+                            )
+                        if companies.empty:
+                            matched_companies = companies
+                        else:
+                            normalized_query = re.sub(
+                                r"\s|\(주\)|주식회사|유한회사", "", company_query.strip(), flags=re.I
+                            )
+                            normalized_names = companies["업체명"].str.replace(
+                                r"\s|\(주\)|주식회사|유한회사", "", regex=True
+                            )
+                            matched_companies = companies[
+                                normalized_names.str.contains(
+                                    normalized_query, case=False, na=False, regex=False
+                                )
+                            ]
+                            if license_type == "실내건축공사업":
+                                matched_companies = matched_companies[
+                                    matched_companies["면허·업종"].str.contains("실내건축", na=False)
+                                ]
+                            elif license_type == "기계설비공사업":
+                                matched_companies = matched_companies[
+                                    matched_companies["면허·업종"].str.contains(
+                                        "기계설비|기계가스설비", na=False, regex=True
+                                    )
+                                ]
+                        if matched_companies.empty:
+                            st.warning(
+                                "선택한 공시기간에서 일치하는 업체를 찾지 못했습니다. "
+                                "등록이 오래된 업체일 수 있으니 기간을 늘리거나 아래 공식 조회를 이용해 주세요."
+                            )
+                        else:
+                            st.success(
+                                f"검색 결과 {len(matched_companies):,}건 "
+                                f"(해당 기간·지역 전체 공시 {kiscon_total:,}건)"
+                            )
+                            st.dataframe(
+                                matched_companies,
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                    except Exception as exc:
+                        st.error(f"KISCON API 연결에 실패했습니다: {exc}")
+                        st.caption("활용신청 직후에는 인증키 반영까지 시간이 걸릴 수 있습니다.")
+            st.link_button(
+                "KISCON에서 업체 최신 상태 최종 확인",
+                "https://www.kiscon.or.kr/m22_1.php",
+                use_container_width=True,
+            )
 
 with tab2:
     st.subheader("글로벌 원자재 가격 추세")
