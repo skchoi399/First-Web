@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 import html
+import json
 import re
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -123,6 +125,81 @@ def load_commodity_prices() -> tuple[pd.DataFrame, str]:
     return out.sort_values("date").tail(36), "FRED · IMF Primary Commodity Prices"
 
 
+G2B_ENDPOINTS = {
+    "건축": "getPriceInfoListFcltyCmmnMtrilBildng",
+    "기계설비": "getPriceInfoListFcltyCmmnMtrilMchnEqp",
+    "전기·정보통신": "getPriceInfoListFcltyCmmnMtrilElctyIrmc",
+}
+
+
+def get_data_go_key() -> str:
+    try:
+        return str(st.secrets.get("DATA_GO_KR_KEY", "")).strip()
+    except Exception:
+        return ""
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_g2b_prices(
+    service_key: str, category: str, item_keyword: str, spec_keyword: str
+) -> tuple[pd.DataFrame, int]:
+    endpoint = G2B_ENDPOINTS[category]
+    params = {
+        "serviceKey": service_key,
+        "pageNo": 1,
+        "numOfRows": 100,
+        "type": "json",
+    }
+    if item_keyword.strip():
+        params["prdctClsfcNoNm"] = item_keyword.strip()
+    if spec_keyword.strip():
+        params["krnPrdctNm"] = spec_keyword.strip()
+
+    url = (
+        f"https://apis.data.go.kr/1230000/ao/PriceInfoService/{endpoint}?"
+        + urllib.parse.urlencode(params)
+    )
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (compatible; InteriorDaily/1.0)"}
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    api_response = payload.get("response", payload)
+    header = api_response.get("header", {})
+    result_code = str(header.get("resultCode", ""))
+    if result_code not in {"00", "0"}:
+        message = header.get("resultMsg", "공공데이터 API 요청 실패")
+        raise ValueError(f"{message} (코드 {result_code})")
+
+    body = api_response.get("body", {})
+    raw_items = body.get("items", {})
+    if isinstance(raw_items, dict):
+        raw_items = raw_items.get("item", [])
+    if isinstance(raw_items, dict):
+        raw_items = [raw_items]
+    if not isinstance(raw_items, list):
+        raw_items = []
+
+    rows = []
+    for item in raw_items:
+        rows.append(
+            {
+                "품명": item.get("prdctClsfcNoNm", ""),
+                "규격": item.get("krnPrdctNm", ""),
+                "단위": item.get("unit", ""),
+                "가격(원)": pd.to_numeric(item.get("prce"), errors="coerce"),
+                "게시일": str(item.get("nticeDt", ""))[:10],
+                "공급지역": item.get("splyJrsdctRgnNm", ""),
+                "VAT": item.get("vatYnNm", ""),
+                "인도조건": item.get("dlvryCndtnNm", ""),
+                "가격구분": item.get("prceDiv", ""),
+                "물품분류번호": item.get("prdctClsfcNo", ""),
+            }
+        )
+    return pd.DataFrame(rows), int(body.get("totalCount", len(rows)) or 0)
+
+
 def news_card(row: pd.Series) -> str:
     tags = "".join(f'<span class="tag">{html.escape(tag)}</span>' for tag in row["tags"])
     summary = html.escape(row["summary"] or "원문에서 세부 내용을 확인하세요.")
@@ -169,7 +246,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab1, tab2, tab3 = st.tabs(["📰 주요 뉴스", "📈 원자재 동향", "🧱 품목별 영향"])
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["📰 주요 뉴스", "📈 원자재 동향", "🧱 품목별 영향", "💰 조달 자재가격"]
+)
 
 with tab1:
     st.subheader("건설·건축·실내건축 주요 뉴스")
@@ -223,5 +302,62 @@ with tab3:
     st.dataframe(impact, use_container_width=True, hide_index=True)
     st.warning("이 화면에는 회사 내부 견적, 협력사 정보, 점포명 등 비공개 데이터를 입력하지 마세요.")
 
+with tab4:
+    st.subheader("나라장터 시설공통자재 가격 조회")
+    st.caption(
+        "조달청 가격정보현황서비스의 공개 참고가격입니다. 실제 시장가·견적가·계약단가와 다를 수 있습니다."
+    )
+    service_key = get_data_go_key()
+    if not service_key:
+        st.error("API 인증키가 없습니다. Streamlit 앱 설정의 Secrets에 DATA_GO_KR_KEY를 저장해 주세요.")
+    else:
+        st.success("공공데이터포털 인증키가 연결되어 있습니다.")
+        c1, c2, c3 = st.columns([1, 1.4, 1.4])
+        with c1:
+            g2b_category = st.selectbox("공사 분야", list(G2B_ENDPOINTS))
+        with c2:
+            g2b_item = st.text_input(
+                "품명", placeholder="예: 타일, 유리, 전선, 합판"
+            )
+        with c3:
+            g2b_spec = st.text_input(
+                "규격명(선택)", placeholder="예: 자기질, 강화, 난연"
+            )
+
+        if st.button("가격 조회", type="primary", use_container_width=True):
+            if not g2b_item.strip() and not g2b_spec.strip():
+                st.warning("품명이나 규격명 중 하나를 입력해 주세요. 처음에는 ‘타일’을 추천합니다.")
+            else:
+                try:
+                    with st.spinner("조달청 공개가격을 조회하고 있습니다..."):
+                        g2b_prices, total_count = load_g2b_prices(
+                            service_key, g2b_category, g2b_item, g2b_spec
+                        )
+                    if g2b_prices.empty:
+                        st.info("검색 결과가 없습니다. 품명을 짧게 입력해 보세요. 예: 타일, 유리, 전선")
+                    else:
+                        st.metric("검색 결과", f"전체 {total_count:,}건 · 최대 100건 표시")
+                        st.dataframe(
+                            g2b_prices,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "가격(원)": st.column_config.NumberColumn(format="%,.0f원")
+                            },
+                        )
+                        csv_data = g2b_prices.to_csv(index=False).encode("utf-8-sig")
+                        st.download_button(
+                            "조회 결과 CSV 다운로드",
+                            data=csv_data,
+                            file_name=f"나라장터_{g2b_category}_{g2b_item or g2b_spec}.csv",
+                            mime="text/csv",
+                        )
+                except Exception as exc:
+                    st.error(f"조달청 API 연결에 실패했습니다: {exc}")
+                    st.caption(
+                        "신규 승인 직후라면 인증키 적용에 시간이 걸릴 수 있습니다. "
+                        "공공데이터포털의 Decoding 인증키인지도 확인해 주세요."
+                    )
+
 st.divider()
-st.caption("자료 출처: Google News의 국토부·정책 검색 RSS, 각 전문매체 RSS, FRED·IMF 원자재 가격. 원문 저작권은 각 제공처에 있습니다.")
+st.caption("자료 출처: Google News의 국토부·정책 검색 RSS, 각 전문매체 RSS, FRED·IMF 원자재 가격, 조달청 가격정보현황서비스. 원문 저작권은 각 제공처에 있습니다.")
