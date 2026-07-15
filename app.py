@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import html
+import io
 import json
 import re
 import urllib.parse
@@ -96,8 +97,8 @@ def load_news() -> tuple[pd.DataFrame, list[str]]:
     return pd.DataFrame(rows), failed
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_commodity_prices() -> tuple[pd.DataFrame, str]:
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_commodity_prices() -> tuple[pd.DataFrame, str, list[str]]:
     """Load individual IMF commodity series through FRED's stable CSV endpoint."""
     series = {
         "PCOPPUSDM": "구리",
@@ -106,23 +107,122 @@ def load_commodity_prices() -> tuple[pd.DataFrame, str]:
         "PIORECRUSDM": "철광석",
         "PLOGOREUSDM": "원목",
     }
-    frames = []
+    frames, failed = [], []
     for code, korean_name in series.items():
         try:
             url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}"
-            frame = pd.read_csv(url)
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; InteriorDaily/1.0)",
+                    "Accept": "text/csv,*/*",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=20) as response:
+                raw_csv = response.read()
+            frame = pd.read_csv(io.BytesIO(raw_csv))
             frame.columns = ["date", korean_name]
             frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
             frame[korean_name] = pd.to_numeric(frame[korean_name], errors="coerce")
-            frames.append(frame.dropna(subset=["date"]))
-        except Exception:
-            continue
+            frame = frame.dropna(subset=["date", korean_name])
+            if frame.empty:
+                raise ValueError("공표값 없음")
+            frames.append(frame)
+        except Exception as exc:
+            failed.append(f"{korean_name}: {type(exc).__name__}")
     if not frames:
-        return pd.DataFrame(), "FRED 원자재 자료 연결 대기"
+        return pd.DataFrame(), "FRED 원자재 자료 연결 대기", failed
     out = frames[0]
     for frame in frames[1:]:
         out = out.merge(frame, on="date", how="outer")
-    return out.sort_values("date").tail(36), "FRED · IMF Primary Commodity Prices"
+    return out.sort_values("date").tail(36), "FRED · IMF Primary Commodity Prices", failed
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_franchise_interior_costs(
+    service_key: str, base_year: str, brand_manage_no: str
+) -> tuple[pd.DataFrame, int]:
+    params = {
+        "serviceKey": service_key,
+        "pageNo": 1,
+        "numOfRows": 100,
+        "resultType": "json",
+        "type": "json",
+        "_type": "json",
+    }
+    if base_year.strip():
+        params["yr"] = base_year.strip()
+    if brand_manage_no.strip():
+        params["brandManageNo"] = brand_manage_no.strip()
+
+    url = (
+        "https://apis.data.go.kr/1130000/FftcBrandFrcsIntInfo2_Service/"
+        "getbrandFrcsBzmnIntrrctinfo?" + urllib.parse.urlencode(params)
+    )
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (compatible; InteriorDaily/1.0)"}
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        raw = response.read()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        root = ET.fromstring(raw)
+        payload = {
+            "response": {
+                "header": {
+                    "resultCode": root.findtext(".//resultCode", ""),
+                    "resultMsg": root.findtext(".//resultMsg", ""),
+                },
+                "body": {
+                    "totalCount": root.findtext(".//totalCount", "0"),
+                    "items": [
+                        {child.tag: child.text or "" for child in item}
+                        for item in root.findall(".//item")
+                    ],
+                },
+            }
+        }
+
+    api_response = payload.get("response", payload)
+    header = api_response.get("header", {})
+    code = str(header.get("resultCode", ""))
+    if code not in {"00", "0"}:
+        raise ValueError(f"{header.get('resultMsg', 'API 요청 실패')} (코드 {code})")
+    body = api_response.get("body", {})
+    items = body.get("items", [])
+    if isinstance(items, dict):
+        items = items.get("item", items)
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list):
+        items = []
+
+    def pick(item: dict, *names: str):
+        for name in names:
+            if item.get(name) not in {None, ""}:
+                return item.get(name)
+        return ""
+
+    rows = []
+    for item in items:
+        rows.append(
+            {
+                "기준년도": pick(item, "yr", "baseYr", "bsnsYr"),
+                "브랜드명": pick(item, "brandNm", "brndNm"),
+                "브랜드관리번호": pick(item, "brandManageNo", "brndMngNo"),
+                "단위면적 인테리어금액": pd.to_numeric(
+                    pick(item, "unitArIntrrAmt", "unitAreaIntrrAmt"), errors="coerce"
+                ),
+                "인테리어금액": pd.to_numeric(
+                    pick(item, "intrrAmt", "interiorAmt"), errors="coerce"
+                ),
+                "점포기준면적": pd.to_numeric(
+                    pick(item, "storCrtraAr", "storeStdArea", "storBasAr"), errors="coerce"
+                ),
+            }
+        )
+    return pd.DataFrame(rows), int(body.get("totalCount", len(rows)) or 0)
 
 
 G2B_ENDPOINTS = {
@@ -225,7 +325,7 @@ with right:
     st.markdown(f"<div style='text-align:right;color:#7a8290;padding-top:18px'>{today}<br>접속 시 자동 갱신</div>", unsafe_allow_html=True)
 
 news, failed_feeds = load_news()
-prices, price_source = load_commodity_prices()
+prices, price_source, failed_prices = load_commodity_prices()
 
 news_count = len(news)
 policy_count = int(news["tags"].apply(lambda x: "정책·법규" in x).sum()) if news_count else 0
@@ -246,8 +346,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["📰 주요 뉴스", "📈 원자재 동향", "🧱 품목별 영향", "💰 조달 자재가격"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["📰 주요 뉴스", "📈 원자재 동향", "🧱 품목별 영향", "💰 조달 자재가격", "🏪 브랜드 인테리어비"]
 )
 
 with tab1:
@@ -271,7 +371,12 @@ with tab2:
     st.subheader("글로벌 원자재 월별 추세")
     st.caption(f"출처: {price_source} · 최신 공표값 기준이며 실시간 거래가격이 아닙니다.")
     if prices.empty:
-        st.info("원자재 자료가 일시적으로 연결되지 않았습니다. 뉴스 탭은 계속 사용할 수 있습니다.")
+        st.error("원자재 제공처가 현재 응답하지 않습니다.")
+        if failed_prices:
+            st.caption("연결 진단: " + " · ".join(failed_prices))
+        if st.button("원자재 다시 불러오기"):
+            load_commodity_prices.clear()
+            st.rerun()
     else:
         options = [c for c in prices.columns if c != "date"]
         selected = st.multiselect("표시 품목", options, default=options[:3])
@@ -285,6 +390,8 @@ with tab2:
                     prev, curr = latest[name].iloc[-2], latest[name].iloc[-1]
                     change = ((curr / prev) - 1) * 100 if pd.notna(prev) and prev else 0
                     card.metric(name, f"{curr:,.1f}", f"{change:+.1f}% 전월비")
+        if failed_prices:
+            st.caption("일부 품목 연결 대기: " + " · ".join(failed_prices))
 
 with tab3:
     st.subheader("시장지표가 인테리어 품목에 미치는 일반적 영향")
@@ -359,5 +466,47 @@ with tab4:
                         "공공데이터포털의 Decoding 인증키인지도 확인해 주세요."
                     )
 
+with tab5:
+    st.subheader("프랜차이즈 브랜드 가맹점 인테리어 비용")
+    st.caption("정보공개서 기반 공개자료입니다. 실제 공사 견적이나 현재 계약금액과 다를 수 있습니다.")
+    service_key = get_data_go_key()
+    if not service_key:
+        st.error("Streamlit Secrets에 DATA_GO_KR_KEY를 저장해 주세요.")
+    else:
+        f1, f2 = st.columns(2)
+        with f1:
+            franchise_year = st.text_input("기준년도", placeholder="예: 2023")
+        with f2:
+            franchise_brand_no = st.text_input(
+                "브랜드관리번호", placeholder="공공데이터 명세의 브랜드관리번호"
+            )
+        st.caption("둘 중 하나 이상을 입력하세요. 브랜드명 검색은 추후 브랜드 목록 API를 연결하면 추가할 수 있습니다.")
+        if st.button("브랜드 인테리어 비용 조회", type="primary", use_container_width=True):
+            if not franchise_year.strip() and not franchise_brand_no.strip():
+                st.warning("기준년도 또는 브랜드관리번호를 입력해 주세요.")
+            else:
+                try:
+                    with st.spinner("가맹정보를 조회하고 있습니다..."):
+                        franchise_costs, franchise_total = load_franchise_interior_costs(
+                            service_key, franchise_year, franchise_brand_no
+                        )
+                    if franchise_costs.empty:
+                        st.info("검색 결과가 없습니다. 기준년도나 브랜드관리번호를 확인해 주세요.")
+                    else:
+                        st.metric("검색 결과", f"전체 {franchise_total:,}건 · 최대 100건 표시")
+                        st.dataframe(
+                            franchise_costs,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "단위면적 인테리어금액": st.column_config.NumberColumn(format="%,.0f원"),
+                                "인테리어금액": st.column_config.NumberColumn(format="%,.0f원"),
+                                "점포기준면적": st.column_config.NumberColumn(format="%,.2f㎡"),
+                            },
+                        )
+                except Exception as exc:
+                    st.error(f"가맹정보 API 연결에 실패했습니다: {exc}")
+                    st.caption("신규 승인 직후라면 인증키 반영까지 시간이 걸릴 수 있습니다.")
+
 st.divider()
-st.caption("자료 출처: Google News의 국토부·정책 검색 RSS, 각 전문매체 RSS, FRED·IMF 원자재 가격, 조달청 가격정보현황서비스. 원문 저작권은 각 제공처에 있습니다.")
+st.caption("자료 출처: Google News의 국토부·정책 검색 RSS, 각 전문매체 RSS, FRED·IMF 원자재 가격, 조달청 가격정보현황서비스, 공정거래위원회 가맹정보. 원문 저작권은 각 제공처에 있습니다.")
